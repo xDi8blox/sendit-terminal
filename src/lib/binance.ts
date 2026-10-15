@@ -41,22 +41,33 @@ function simKlines(symbol: string, interval: Interval, n: number): Kline[] {
 }
 
 // ---------- multiplexed websocket ----------
+// Streams are encoded in the URL (/stream?streams=a/b/c). When the set changes we reconnect (debounced),
+// which works on both stream.binance.com and the data-stream.binance.vision mirror.
 type Handler = (data: unknown) => void
 class Stream {
-  private ws?: WebSocket; private host = 0; private handlers = new Map<string, Set<Handler>>(); private id = 1; private backoff = 500; private open = false
+  private ws?: WebSocket; private host = 0; private handlers = new Map<string, Set<Handler>>(); private backoff = 1000; private fails = 0
+  private key = ''; private reT = 0; private got = false
   status: 'connecting' | 'live' | 'sim' = 'connecting'; onStatus?: (s: Stream['status']) => void
-  private fails = 0
+  private schedule(ms = 250) { clearTimeout(this.reT); this.reT = window.setTimeout(() => this.connect(), ms) }
   private connect() {
-    const ws = new WebSocket(WS[this.host]); this.ws = ws
-    ws.onopen = () => { this.open = true; this.backoff = 500; this.fails = 0; this.set('live'); if (this.handlers.size) this.send('SUBSCRIBE', [...this.handlers.keys()]) }
-    ws.onmessage = (e) => { const m = JSON.parse(e.data); if (m.stream) this.handlers.get(m.stream)?.forEach((h) => h(m.data)) }
-    ws.onclose = () => {
-      this.open = false; this.fails++
-      if (this.fails >= 4 && this.status !== 'live') this.set('sim')
-      this.host = (this.host + 1) % WS.length
-      setTimeout(() => this.connect(), this.backoff); this.backoff = Math.min(15000, this.backoff * 2)
+    const keys = [...this.handlers.keys()].sort(), key = keys.join('/')
+    if (!keys.length) { this.ws?.close(); this.ws = undefined; this.key = ''; return }
+    if (key === this.key && this.ws && this.ws.readyState <= 1) return
+    const old = this.ws; this.ws = undefined; old?.close()
+    this.key = key; this.got = false
+    const ws = new WebSocket(`${WS[this.host]}?streams=${key}`); this.ws = ws
+    const guard = setTimeout(() => { if (!this.got) ws.close() }, 6000)
+    ws.onmessage = (e) => {
+      if (!this.got) { this.got = true; this.fails = 0; this.backoff = 1000; this.set('live') }
+      const m = JSON.parse(e.data); if (m.stream) this.handlers.get(m.stream)?.forEach((h) => h(m.data))
     }
-    ws.onerror = () => ws.close()
+    ws.onclose = () => {
+      clearTimeout(guard); if (this.ws !== ws) return
+      this.ws = undefined; this.key = ''
+      if (!this.got) { this.fails++; this.host = (this.host + 1) % WS.length; if (this.fails >= 2) this.set('sim') }
+      this.schedule(this.backoff); this.backoff = Math.min(20000, this.backoff * 2)
+    }
+    ws.onerror = () => { /* onclose follows */ }
   }
   private simT = 0
   private set(s: Stream['status']) {
@@ -81,13 +92,11 @@ class Stream {
       hs.forEach((h) => h(d))
     }
   }
-  private send(method: string, params: string[]) { if (this.open && params.length) this.ws?.send(JSON.stringify({ method, params, id: this.id++ })) }
   sub(stream: string, h: Handler) {
-    if (!this.ws) this.connect()
     let set = this.handlers.get(stream)
-    if (!set) { set = new Set(); this.handlers.set(stream, set); this.send('SUBSCRIBE', [stream]) }
+    if (!set) { set = new Set(); this.handlers.set(stream, set); this.schedule() }
     set.add(h)
-    return () => { set!.delete(h); if (!set!.size) { this.handlers.delete(stream); this.send('UNSUBSCRIBE', [stream]) } }
+    return () => { set!.delete(h); if (!set!.size && this.handlers.get(stream) === set) { this.handlers.delete(stream); this.schedule(1000) } }
   }
 }
 export const stream = new Stream()

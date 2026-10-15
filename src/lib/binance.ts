@@ -1,3 +1,4 @@
+import { getPrice } from './store'
 // Binance public market data (keyless). Falls back to the binance.vision mirror, then to a local simulator.
 const REST = ['https://api.binance.com', 'https://data-api.binance.vision']
 const WS = ['wss://stream.binance.com:9443/stream', 'wss://data-stream.binance.vision/stream']
@@ -59,7 +60,7 @@ class Stream {
     const guard = setTimeout(() => { if (!this.got) ws.close() }, 6000)
     ws.onmessage = (e) => {
       if (!this.got) { this.got = true; this.fails = 0; this.backoff = 1000; this.set('live') }
-      const m = JSON.parse(e.data); if (m.stream) this.handlers.get(m.stream)?.forEach((h) => h(m.data))
+      const m = JSON.parse(e.data); if (m.stream) { this.seen.set(m.stream, Date.now()); this.handlers.get(m.stream)?.forEach((h) => h(m.data)) }
     }
     ws.onclose = () => {
       clearTimeout(guard); if (this.ws !== ws) return
@@ -70,10 +71,10 @@ class Stream {
     ws.onerror = () => { /* onclose follows */ }
   }
   private simT = 0
+  private seen = new Map<string, number>() // last message (or subscribe) time per stream
   private set(s: Stream['status']) {
     this.status = s; this.onStatus?.(s)
-    if (s === 'sim' && !this.simT) this.simT = window.setInterval(() => this.simTick(), 500)
-    if (s === 'live' && this.simT) { clearInterval(this.simT); this.simT = 0 }
+    if (!this.simT) this.simT = window.setInterval(() => this.simTick(), 500)
   }
   /** Emit Binance-shaped synthetic messages for every subscribed stream. */
   private simP = new Map<string, number>()
@@ -81,8 +82,9 @@ class Stream {
   private simTick() {
     const now = Date.now()
     for (const [key, hs] of this.handlers) {
+      if (this.status !== 'sim' && now - (this.seen.get(key) ?? now) < 10000) continue // stream is live
       const [sl, kind] = key.split('@'), sym = sl.toUpperCase()
-      let p = this.simP.get(sym) ?? SEED[sym] ?? 10
+      let p = (this.status === 'live' ? getPrice(sym)?.p : undefined) ?? this.simP.get(sym) ?? getPrice(sym)?.p ?? SEED[sym] ?? 10
       p *= 1 + (Math.random() - 0.5) * 0.0015; this.simP.set(sym, p)
       let d: unknown
       if (kind.startsWith('kline')) { const iv = kind.split('_')[1] as Interval, s = SEC[iv] * 1000, t = Math.floor(now / s) * s; d = { k: { t, o: p, h: p * 1.0005, l: p * 0.9995, c: p, v: Math.random() * 5, x: false } } }
@@ -94,7 +96,7 @@ class Stream {
   }
   sub(stream: string, h: Handler) {
     let set = this.handlers.get(stream)
-    if (!set) { set = new Set(); this.handlers.set(stream, set); this.schedule() }
+    if (!set) { set = new Set(); this.handlers.set(stream, set); this.seen.set(stream, Date.now()); this.schedule(); if (!this.simT) this.simT = window.setInterval(() => this.simTick(), 500) }
     set.add(h)
     return () => { set!.delete(h); if (!set!.size && this.handlers.get(stream) === set) { this.handlers.delete(stream); this.schedule(1000) } }
   }
